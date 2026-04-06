@@ -45,6 +45,15 @@ from models.pricing import (
     TRIM_ORDER,
     _build_pipeline,
 )
+from models.markup import (
+    SOURCE_MARGIN_OVERRIDE,
+    WHOLESALE_MARGIN_HIGH,
+    WHOLESALE_MARGIN_LOW,
+    WHOLESALE_MARGIN_MID,
+    MarkupModel,
+    compute_premiums,
+    summarize_by_group,
+)
 from scraper.parser import parse_listings_from_file
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -706,10 +715,384 @@ def plot_metric_evolution(results: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 6 — Markup analysis (consensus premium + industry-benchmark cost basis)
+# ---------------------------------------------------------------------------
+
+def run_markup_analysis(
+    df_raw: pd.DataFrame,
+) -> tuple[pd.DataFrame, MarkupModel]:
+    """
+    Trains a full-data consensus Ridge model, computes per-listing premiums
+    (Method A), applies industry-benchmark wholesale estimates (Method B), and
+    fits a MarkupModel to predict expected premium % from vehicle features.
+
+    Returns
+    -------
+    df_markup : DataFrame — cleaned listings augmented with markup columns
+    markup_model : fitted MarkupModel
+    """
+    print("=" * 64)
+    print("STEP 6 — Dealer markup estimation")
+    print("=" * 64)
+
+    clean = clean_df(df_raw)
+
+    # Consensus pipeline trained on ALL clean data — the goal here is
+    # "market consensus value for each listing", not held-out prediction.
+    consensus_pipe = _build_pipeline("ridge")
+    consensus_pipe.fit(clean[FEATURE_COLS].values, clean[TARGET_COL].values)
+
+    df_markup = compute_premiums(clean, consensus_pipe)
+
+    # Fit markup model on the enriched data
+    markup_model = MarkupModel()
+    markup_model.fit(df_markup)
+
+    # ------------------------------------------------------------------
+    # Console summary
+    # ------------------------------------------------------------------
+    overall_mean  = df_markup["pct_premium"].mean()
+    overall_med   = df_markup["pct_premium"].median()
+    overall_std   = df_markup["pct_premium"].std()
+
+    print(f"\n  Listings analysed : {len(df_markup)}")
+    print(f"  Premium vs. consensus — "
+          f"mean {overall_mean:+.1f}%  "
+          f"median {overall_med:+.1f}%  "
+          f"σ={overall_std:.1f}%")
+
+    src_stats = summarize_by_group(df_markup, "source")
+    print("\n  By source:")
+    for _, row in src_stats.iterrows():
+        src_adj = SOURCE_MARGIN_OVERRIDE.get(str(row["source"]).lower(),
+                                             WHOLESALE_MARGIN_MID) * 100
+        print(f"    {str(row['source']):<12s}  "
+              f"median premium {row['median']:+.1f}%  "
+              f"NADA/Manheim benchmark markup {src_adj:.1f}%")
+
+    # Markup prediction for the target vehicle
+    print(f"\n  Target vehicle markup estimate "
+          f"({TARGET_YEAR} {TARGET_TRIM.title()} @ {TARGET_MILEAGE:,} mi):")
+    for src, margin in [("autotrader", 0.115), ("cargurus", 0.115),
+                        ("cars.com",   0.115), ("carmax",   0.085)]:
+        expected_premium = markup_model.predict(
+            TARGET_YEAR, TARGET_MILEAGE, TARGET_TRIM, src
+        )
+        # Method A: consensus from the trials
+        # Method B: industry margin
+        method_b_markup = margin * 100
+        print(f"    [{src:<12s}]  "
+              f"expected premium over consensus = {expected_premium:+.1f}%  "
+              f"|  benchmark markup = {method_b_markup:.1f}%")
+
+    markup_model.report()
+    print()
+    return df_markup, markup_model
+
+
+# ---------------------------------------------------------------------------
+# Figure 7 — Markup distribution (premiums by source / trim / year)
+# ---------------------------------------------------------------------------
+
+def plot_markup_analysis(
+    df_markup: pd.DataFrame,
+    markup_model: MarkupModel,
+) -> None:
+    fig = plt.figure(figsize=(17, 11))
+    fig.suptitle(
+        "Dealer Markup Analysis — Listing Premium vs. Market Consensus",
+        fontsize=14, fontweight="bold", y=1.00,
+    )
+    gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.52, wspace=0.38)
+
+    # ── A. Violin: dollar_premium by source ───────────────────────────────
+    ax0 = fig.add_subplot(gs[0, :2])
+    sources_ord = [s for s in ["cars.com", "autotrader", "cargurus", "carmax"]
+                   if s in df_markup["source"].unique()]
+    premium_by_src = [df_markup[df_markup["source"] == s]["pct_premium"].values
+                      for s in sources_ord]
+    src_colors = ["#4e8cff", "#2ecc71", "#e74c3c", "#f39c12"]
+
+    parts = ax0.violinplot(premium_by_src, positions=range(len(sources_ord)),
+                           showmedians=True, showextrema=True, widths=0.65)
+    for i, (pc, col) in enumerate(zip(parts["bodies"], src_colors)):
+        pc.set_facecolor(col)
+        pc.set_alpha(0.55)
+    parts["cmedians"].set_color("black")
+    parts["cmedians"].set_linewidth(2)
+
+    # Method B benchmark markup lines
+    for i, src in enumerate(sources_ord):
+        bm = SOURCE_MARGIN_OVERRIDE.get(src.lower(), WHOLESALE_MARGIN_MID) * 100
+        ax0.hlines(bm, i - 0.35, i + 0.35,
+                   colors="black", linestyles=":", linewidth=1.8)
+        ax0.text(i + 0.38, bm, f"↑ {bm:.1f}% NADA\nbenchmark",
+                 va="center", fontsize=7.5, color="black")
+
+    ax0.axhline(0, color="gray", linestyle="--", linewidth=1, alpha=0.6)
+    ax0.set_xticks(range(len(sources_ord)))
+    ax0.set_xticklabels([s.title() for s in sources_ord], fontsize=10)
+    ax0.set_ylabel("Premium over consensus (%)")
+    ax0.set_title("Price Premium by Source\n"
+                  "(positive = priced above model consensus; dotted = NADA/Manheim benchmark)")
+    ax0.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
+    ax0.grid(True, axis="y", alpha=0.25)
+
+    # ── B. Per-source Method B breakdown table ─────────────────────────────
+    ax1 = fig.add_subplot(gs[0, 2])
+    ax1.axis("off")
+    src_table_data = []
+    for src in sources_ord:
+        sub = df_markup[df_markup["source"] == src]
+        bm  = SOURCE_MARGIN_OVERRIDE.get(src.lower(), WHOLESALE_MARGIN_MID) * 100
+        src_table_data.append([
+            src.title(),
+            f"{sub['pct_premium'].median():+.1f}%",
+            f"{bm:.1f}%",
+            f"${sub['est_markup_dollars'].median():,.0f}",
+            f"${sub['negotiation_target'].median():,.0f}",
+        ])
+    tbl = ax1.table(
+        cellText=src_table_data,
+        colLabels=["Source", "Median\nPremium", "Benchmark\nMarkup",
+                   "Est. Dealer\nProfit", "Suggested\nOffer"],
+        loc="center", cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8.5)
+    tbl.scale(1.0, 2.2)
+    for j in range(5):
+        tbl[0, j].set_facecolor("#2c3e50")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+    for row_i, col in enumerate(src_colors[:len(sources_ord)], start=1):
+        rgba = mcolors.to_rgba(col, alpha=0.18)
+        for j in range(5):
+            tbl[row_i, j].set_facecolor(rgba)
+    ax1.set_title("Source Markup Summary\n(NADA/Manheim benchmarks)", pad=14, fontsize=9)
+
+    # ── C. Median premium by trim (bar with error band) ───────────────────
+    ax2 = fig.add_subplot(gs[1, :2])
+    trim_present = [t for t in TRIM_ORDER if t in df_markup["trim"].unique()]
+    medians = [df_markup[df_markup["trim"] == t]["pct_premium"].median()
+               for t in trim_present]
+    stds    = [df_markup[df_markup["trim"] == t]["pct_premium"].std()
+               for t in trim_present]
+    bar_cols = ["#c0392b" if m > 0 else "#27ae60" for m in medians]
+    ax2.bar(range(len(trim_present)), medians, yerr=stds, capsize=4,
+            color=bar_cols, edgecolor="k", linewidth=0.5, alpha=0.75,
+            error_kw={"elinewidth": 1.2, "alpha": 0.6})
+    ax2.axhline(0, color="gray", linestyle="--", linewidth=1.2, alpha=0.7)
+    ax2.set_xticks(range(len(trim_present)))
+    ax2.set_xticklabels([t.title() for t in trim_present], rotation=18, ha="right")
+    ax2.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
+    ax2.set_ylabel("Median premium over consensus (%)")
+    ax2.set_title("Median Listing Premium by Trim Level  (error bar = ±1 σ)\n"
+                  "Red = priced above consensus  |  Green = below")
+    ax2.grid(True, axis="y", alpha=0.25)
+
+    # ── D. Premium scatter by year ─────────────────────────────────────────
+    ax3 = fig.add_subplot(gs[1, 2])
+    years = sorted(df_markup["year"].unique())
+    try:
+        cmap = plt.colormaps["plasma"].resampled(len(years))
+    except AttributeError:
+        cmap = plt.cm.get_cmap("plasma", len(years))
+    for i, yr in enumerate(years):
+        sub = df_markup[df_markup["year"] == yr]
+        jitter = np.random.default_rng(yr).uniform(-0.2, 0.2, len(sub))
+        ax3.scatter(np.full(len(sub), yr) + jitter,
+                    sub["pct_premium"],
+                    color=cmap(i), alpha=0.6, edgecolors="k",
+                    linewidths=0.3, s=35)
+        ax3.plot([yr - 0.3, yr + 0.3],
+                 [sub["pct_premium"].median(), sub["pct_premium"].median()],
+                 color=cmap(i), linewidth=3, zorder=5)
+    ax3.axhline(0, color="gray", linestyle="--", linewidth=1.2, alpha=0.7)
+    ax3.yaxis.set_major_formatter(mticker.PercentFormatter(decimals=0))
+    ax3.set_xlabel("Model Year")
+    ax3.set_ylabel("Premium (%)")
+    ax3.set_title("Premium by Model Year\n(thick bar = median)")
+    ax3.grid(True, alpha=0.25)
+
+    _savefig(fig, "07_markup_analysis.png")
+
+
+# ---------------------------------------------------------------------------
+# Figure 8 — Cost basis scatter + target vehicle negotiation summary
+# ---------------------------------------------------------------------------
+
+def plot_cost_basis(
+    df_markup: pd.DataFrame,
+    markup_model: MarkupModel,
+) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle(
+        "Estimated Cost Basis & Negotiation Targets\n"
+        "(industry benchmark: NADA / Cox Automotive / Manheim Q4-2023)",
+        fontsize=12, fontweight="bold",
+    )
+
+    # ── Left: Asking price vs estimated wholesale (Method B mid) ──────────
+    ax = axes[0]
+    sources_ord = [s for s in ["cars.com", "autotrader", "cargurus", "carmax"]
+                   if s in df_markup["source"].unique()]
+    src_colors  = ["#4e8cff", "#2ecc71", "#e74c3c", "#f39c12"]
+
+    all_prices = df_markup[TARGET_COL].values
+    price_min  = all_prices.min() * 0.95
+    price_max  = all_prices.max() * 1.05
+
+    # Zero-profit reference line
+    ax.plot([price_min, price_max], [price_min, price_max],
+            "k--", linewidth=1, alpha=0.4, label="Zero markup (reference)")
+
+    for i, src in enumerate(sources_ord):
+        sub = df_markup[df_markup["source"] == src]
+        ax.scatter(sub[TARGET_COL], sub["est_wholesale_mid"],
+                   color=src_colors[i], alpha=0.65,
+                   edgecolors="k", linewidths=0.3, s=50,
+                   label=src.title(), zorder=4)
+
+    # Low/high wholesale bands (shaded)
+    xs = np.array([price_min, price_max])
+    mid_margin = 1 - WHOLESALE_MARGIN_MID
+    lo_margin  = 1 - WHOLESALE_MARGIN_HIGH
+    hi_margin  = 1 - WHOLESALE_MARGIN_LOW
+    ax.fill_between(xs, xs * lo_margin, xs * hi_margin,
+                    color="gray", alpha=0.10, label="8–15% markup band")
+    ax.plot(xs, xs * mid_margin, "gray", linewidth=1.2,
+            linestyle="-.", alpha=0.6, label=f"{WHOLESALE_MARGIN_MID*100:.1f}% midpoint")
+
+    # Negotiation target markers for each listing
+    ax.scatter(df_markup[TARGET_COL], df_markup["negotiation_target"],
+               marker="v", color="gold", edgecolors="k", linewidths=0.5,
+               s=40, alpha=0.55, zorder=3, label="Suggested offer")
+
+    # Target vehicle annotation
+    target_ask = float(df_markup[
+        (df_markup["year"] == TARGET_YEAR) &
+        (df_markup["trim"] == TARGET_TRIM)
+    ][TARGET_COL].median()) if len(df_markup[
+        (df_markup["year"] == TARGET_YEAR) &
+        (df_markup["trim"] == TARGET_TRIM)
+    ]) else None
+
+    ax.set_xlim(price_min, price_max)
+    ax.set_ylim(price_min * 0.90, price_max)
+    ax.xaxis.set_major_formatter(FMT_DOLLAR_K)
+    ax.yaxis.set_major_formatter(FMT_DOLLAR_K)
+    ax.set_xlabel("Asking Price ($)")
+    ax.set_ylabel("Estimated Wholesale Cost Basis ($)")
+    ax.set_title("Asking Price vs. Estimated Wholesale Cost\n"
+                 "(▼ = suggested offer = consensus − ½ × excess premium)")
+    ax.legend(fontsize=8, framealpha=0.9, loc="upper left")
+    ax.grid(True, alpha=0.25)
+
+    # ── Right: Target vehicle negotiation table ────────────────────────────
+    ax2 = axes[1]
+    ax2.axis("off")
+
+    gt_sub = df_markup[
+        (df_markup["year"] == TARGET_YEAR) & (df_markup["trim"] == TARGET_TRIM)
+    ]
+
+    if len(gt_sub) == 0:
+        ax2.text(0.5, 0.5,
+                 f"No {TARGET_YEAR} {TARGET_TRIM.title()} listings in dataset",
+                 ha="center", va="center", fontsize=11)
+        _savefig(fig, "08_cost_basis.png")
+        return
+
+    src_analysis = []
+    for src in sources_ord:
+        sub = gt_sub[gt_sub["source"] == src]
+        if len(sub) == 0:
+            continue
+        ask_med   = sub[TARGET_COL].median()
+        cons_med  = sub["consensus_price"].median()
+        prem_med  = sub["pct_premium"].median()
+        whole_med = sub["est_wholesale_mid"].median()
+        deal_med  = sub["est_markup_dollars"].median()
+        neg_med   = sub["negotiation_target"].median()
+        markup_pm = markup_model.predict(TARGET_YEAR, TARGET_MILEAGE, TARGET_TRIM, src)
+        src_analysis.append([
+            src.title(),
+            f"${ask_med:,.0f}",
+            f"${cons_med:,.0f}",
+            f"{prem_med:+.1f}%",
+            f"${whole_med:,.0f}",
+            f"${deal_med:,.0f}",
+            f"${neg_med:,.0f}",
+            f"{markup_pm:+.1f}%",
+        ])
+
+    if not src_analysis:
+        # Fall back to all sources combined
+        ask_med   = gt_sub[TARGET_COL].median()
+        cons_med  = gt_sub["consensus_price"].median()
+        prem_med  = gt_sub["pct_premium"].median()
+        whole_med = gt_sub["est_wholesale_mid"].median()
+        deal_med  = gt_sub["est_markup_dollars"].median()
+        neg_med   = gt_sub["negotiation_target"].median()
+        markup_pm = markup_model.predict(TARGET_YEAR, TARGET_MILEAGE, TARGET_TRIM, "cars.com")
+        src_analysis.append([
+            "All sources",
+            f"${ask_med:,.0f}",
+            f"${cons_med:,.0f}",
+            f"{prem_med:+.1f}%",
+            f"${whole_med:,.0f}",
+            f"${deal_med:,.0f}",
+            f"${neg_med:,.0f}",
+            f"{markup_pm:+.1f}%",
+        ])
+
+    col_labels = [
+        "Source", "Median Ask", "Consensus\nValue", "Premium",
+        "Est. Wholesale", "Est. Dealer\nProfit", "Suggested\nOffer",
+        "Model\nMarkup%",
+    ]
+    tbl = ax2.table(
+        cellText=src_analysis,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1.05, 2.4)
+    for j in range(len(col_labels)):
+        tbl[0, j].set_facecolor("#2c3e50")
+        tbl[0, j].set_text_props(color="white", fontweight="bold")
+    src_colors_map = dict(zip(
+        [s.title() for s in sources_ord],
+        mcolors.to_rgba_array(["#4e8cff", "#2ecc71", "#e74c3c", "#f39c12"])
+    ))
+    for row_i, row_data in enumerate(src_analysis, start=1):
+        src_key = row_data[0]
+        rgba = src_colors_map.get(src_key, mcolors.to_rgba("#aaaaaa"))
+        for j in range(len(col_labels)):
+            tbl[row_i, j].set_facecolor((*rgba[:3], 0.18))
+
+    ax2.set_title(
+        f"Target: {TARGET_YEAR} Mazda CX-9 {TARGET_TRIM.title()}\n"
+        f"@ {TARGET_MILEAGE:,} miles — Markup Breakdown by Source",
+        pad=18, fontsize=9,
+    )
+
+    fig.tight_layout()
+    _savefig(fig, "08_cost_basis.png")
+
+
+# ---------------------------------------------------------------------------
 # Step 5 — Console summary report
 # ---------------------------------------------------------------------------
 
-def print_final_report(df: pd.DataFrame, results: pd.DataFrame) -> None:
+def print_final_report(
+    df: pd.DataFrame,
+    results: pd.DataFrame,
+    df_markup: pd.DataFrame | None = None,
+    markup_model: MarkupModel | None = None,
+) -> None:
     clean = clean_df(df)
     print("\n" + "=" * 64)
     print("FINAL SUMMARY REPORT")
@@ -748,6 +1131,48 @@ def print_final_report(df: pd.DataFrame, results: pd.DataFrame) -> None:
         ]
         print("  ".join(c.ljust(w) for c, w in zip(cols, col_w)))
 
+    # ------------------------------------------------------------------
+    # Markup / negotiation section
+    # ------------------------------------------------------------------
+    if df_markup is not None and markup_model is not None:
+        print()
+        print("─" * 64)
+        print("MARKUP ANALYSIS (target vehicle)")
+        print("─" * 64)
+
+        gt_sub = df_markup[
+            (df_markup["year"] == TARGET_YEAR) &
+            (df_markup["trim"] == TARGET_TRIM)
+        ]
+
+        if len(gt_sub) > 0:
+            ask_med   = gt_sub[TARGET_COL].median()
+            cons_med  = gt_sub["consensus_price"].median()
+            prem_med  = gt_sub["pct_premium"].median()
+            whole_med = gt_sub["est_wholesale_mid"].median()
+            deal_med  = gt_sub["est_markup_dollars"].median()
+            neg_med   = gt_sub["negotiation_target"].median()
+
+            print(f"\n  {TARGET_YEAR} Mazda CX-9 {TARGET_TRIM.title()} listings: {len(gt_sub)}")
+            print(f"  Median asking price  : ${ask_med:,.0f}")
+            print(f"  Model consensus value: ${cons_med:,.0f}")
+            print(f"  Premium over mkt avg : {prem_med:+.1f}%")
+            print(f"  Est. wholesale basis : ${whole_med:,.0f}  "
+                  f"(using {WHOLESALE_MARGIN_MID*100:.1f}% NADA/Manheim midpoint)")
+            print(f"  Est. dealer profit   : ${deal_med:,.0f}")
+            print(f"  Suggested offer      : ${neg_med:,.0f}  "
+                  f"(consensus − ½ × above-market premium)")
+
+            # Model prediction for target spec
+            for src in ["autotrader", "cargurus", "cars.com", "carmax"]:
+                predicted_prem = markup_model.predict(
+                    TARGET_YEAR, TARGET_MILEAGE, TARGET_TRIM, src
+                )
+                print(f"  Expected markup vs consensus [{src:<12s}]: "
+                      f"{predicted_prem:+.1f}%")
+        else:
+            print(f"  No {TARGET_YEAR} {TARGET_TRIM.title()} listings found in cleaned data.")
+
     print(f"\nFiles written:")
     print(f"  {OUT_CSV}")
     print(f"  {RESULTS_CSV}")
@@ -776,7 +1201,15 @@ def main() -> None:
     plot_residuals(df_raw)
     plot_metric_evolution(results)
 
-    print_final_report(df_raw, results)
+    df_markup, markup_model = run_markup_analysis(df_raw)
+
+    print("=" * 64)
+    print("STEP 7 — Generating markup figures")
+    print("=" * 64)
+    plot_markup_analysis(df_markup, markup_model)
+    plot_cost_basis(df_markup, markup_model)
+
+    print_final_report(df_raw, results, df_markup, markup_model)
 
 
 if __name__ == "__main__":

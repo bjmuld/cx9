@@ -143,6 +143,163 @@ generalisation; a rising or falling trend would indicate data-order sensitivity.
 
 ---
 
+## Dealer markup estimation
+
+`models/markup.py` estimates how much dealer profit is embedded in each listing
+using two complementary methods, then trains a secondary GBM to predict expected
+premium from vehicle features.
+
+### Method A — within-dataset premium
+
+The Ridge model (trained on all 132 listings) produces a *market consensus value*
+for every vehicle given its year, mileage, and trim.  The gap between the actual
+asking price and that consensus is the **relative premium**:
+
+```
+premium % = (asking_price − consensus_price) / consensus_price × 100
+```
+
+Positive values mean the seller is asking above average for that vehicle;
+negative means below.
+
+### Method B — industry-benchmark wholesale reconstruction
+
+Each listing's estimated wholesale (dealer cost) basis is back-calculated from
+published industry margin benchmarks (see [Sources](#dealer-markup-sources) below):
+
+```
+est_wholesale = asking_price × (1 − source_margin)
+est_dealer_profit = asking_price − est_wholesale
+negotiation_target = consensus_price − ½ × max(0, dollar_premium)
+```
+
+| Source | Benchmark markup | Basis |
+|---|---|---|
+| CarMax | 8.5 % | CarMax FY2024 10-K: ~$2,220 GPU per unit |
+| AutoTrader | 11.5 % | Franchise dealers; NADA / Manheim midpoint |
+| CarGurus | 11.5 % | Franchise / independent dealer mix |
+| Cars.com | 11.5 % | Similar franchise / independent mix |
+
+An age correction adds +0.5 % per model year of age (older vehicles carry
+higher reconditioning and uncertainty costs per NADA data).
+
+### Results — premium by source
+
+| Source | Median premium vs. consensus | Benchmark markup |
+|---|---|---|
+| AutoTrader | +1.5 % | 11.5 % |
+| CarGurus | −2.3 % | 11.5 % |
+| CarMax | +2.4 % | 8.5 % |
+| Cars.com | +0.6 % | 11.5 % |
+
+The overall median premium is **+0.8 %** with σ = 6.1 %, meaning most listings
+are priced within one standard deviation of the model consensus.  CarGurus
+listings skew slightly below consensus (dealers competing on price), while
+CarMax listings skew slightly above (fixed no-haggle pricing with reconditioning
+premium).
+
+![Markup analysis — premium distributions by source, trim, and model year](report/07_markup_analysis.png)
+
+### Target vehicle — 2022 Grand Touring @ 43,500 mi
+
+| Metric | Value |
+|---|---|
+| Median asking price (dataset) | $25,499 |
+| Model consensus value | $26,355 |
+| Premium vs. consensus | −3.2 % (below market average) |
+| Est. wholesale basis (11.5 % midpoint) | $22,567 |
+| Est. dealer profit | $3,187 |
+| Suggested offer | $26,355 |
+
+The single 2022 Grand Touring listing in the dataset is priced **below** the
+model consensus, which means it likely represents fair or even below-average
+value.  The suggested offer equals the consensus value (no above-market premium
+to split back).
+
+**Expected premium by source** (MarkupModel GBM prediction for target spec):
+
+| Source | Expected premium over consensus |
+|---|---|
+| AutoTrader | +4.6 % |
+| CarGurus | +0.5 % |
+| Cars.com | +2.7 % |
+| CarMax | +6.1 % |
+
+![Cost basis scatter and negotiation target table by source](report/08_cost_basis.png)
+
+---
+
+## Dealer markup sources
+
+Quantifying how much profit is embedded in a used-vehicle asking price requires
+combining several industry data streams, since dealers do not publish cost
+basis directly.
+
+### NADA Annual Data
+
+The **National Automobile Dealers Association (NADA)** publishes aggregated
+financial data for franchised dealerships in its *Annual NADA Data* report
+(publicly available at nada.org).  Key figures used here:
+
+- **Average used-vehicle front-end gross profit: ~$2,337 / unit** (2023 data,
+  down from pandemic-era peaks of $4,000+ in 2021–2022)
+- "Front-end gross" is the difference between the sale price and the dealer's
+  cost basis (acquisition + reconditioning); it excludes back-end income such
+  as F&I products and manufacturer holdback.
+- Historical norm before 2020: **$1,800–$2,200 / unit**.
+
+### Cox Automotive / Manheim Market Report
+
+**Cox Automotive** operates the Manheim wholesale auction network — the largest
+used-vehicle auction in the US — and publishes quarterly *Manheim Market Reports*
+and monthly *Used Vehicle Value Index* reports (publicly summarised at
+manheim.com and coxautoinc.com).
+
+- **Wholesale-to-retail spread** (the percentage by which retail asking prices
+  exceed the wholesale auction price): returned to **10–14 %** of retail in
+  2023–2024 after the post-pandemic spike to 20–30 % in 2021–2022.
+- The midpoint of **11.5 %** is used as the baseline benchmark in this analysis.
+- Spread varies by segment: mainstream SUVs (including the CX-9) sit near the
+  midpoint; luxury and high-demand vehicles trend higher.
+
+### CarMax FY2024 10-K (SEC filing)
+
+**CarMax** (NYSE: KMX) discloses per-unit GPU (gross profit per unit) in its
+annual 10-K filing with the SEC:
+
+- FY2024 used-vehicle per-unit GPU: **$2,220**
+- CarMax operates a fixed, no-haggle pricing model so this figure is unusually
+  transparent.  It implies a margin of roughly **8–9 %** on their typical
+  retail price point.
+- Source: CarMax FY2024 Annual Report (Form 10-K), filed April 2024,
+  *"Retail Vehicle Sales — Gross Profit"* section.
+
+### iSeeCars / market research
+
+**iSeeCars.com** regularly publishes analysis of listing price premiums
+across dealers and regions, based on millions of scraped listings:
+
+- Average dealer markup above market value fluctuated from **+15–25 %** during
+  peak inventory shortages (Q3 2021 – Q2 2022) to roughly **+3–6 %** by late 2023.
+- Certified Pre-Owned (CPO) listings typically carry a **2–4 % premium** above
+  equivalent non-CPO listings.
+
+### Summary: what to expect at the negotiating table
+
+| Scenario | Typical front-end gross | As % of $27,500 ask |
+|---|---|---|
+| CarMax (no-haggle) | ~$2,200 fixed | ~8 % |
+| Franchise dealer (high-volume) | $1,800–$2,500 | 7–9 % |
+| Franchise dealer (standard) | $2,200–$3,000 | 8–11 % |
+| Independent dealer | $2,500–$4,000 | 9–15 % |
+| Post-pandemic norm (2023–2025) | $2,000–$2,800 | 7–10 % |
+
+A reasonable opening offer is **consensus value − 3–5 %** of the asking price,
+working up toward the consensus value.  Listings already priced below consensus
+(negative premium) offer less room and may already represent good value.
+
+---
+
 ## Setup & usage
 
 ```bash
@@ -194,6 +351,7 @@ cx9/
 ├── models/
 │   ├── __init__.py
 │   ├── pricing.py                ← sklearn pipeline definitions
+│   ├── markup.py                 ← dealer markup estimation module
 │   └── model_results.csv         ← per-iteration metrics from report.py
 ├── scraper/
 │   ├── __init__.py
@@ -204,7 +362,9 @@ cx9/
 │   ├── 03_target_prediction.png
 │   ├── 04_price_vs_mileage_ci.png
 │   ├── 05_residuals.png
-│   └── 06_metric_evolution.png
+│   ├── 06_metric_evolution.png
+│   ├── 07_markup_analysis.png
+│   └── 08_cost_basis.png
 ├── report.py                     ← end-to-end report generator
 ├── analyze.py                    ← interactive CLI script
 └── requirements.txt
